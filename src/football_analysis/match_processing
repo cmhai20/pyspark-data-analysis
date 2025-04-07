@@ -1,0 +1,294 @@
+"""
+Football Match Processing Module
+
+This module processes football match data, calculating team statistics,
+goals, and creating league tables.
+"""
+
+from pyspark.sql import functions as f
+from pyspark.sql import Window
+from pyspark.sql import DataFrame
+
+def load_event_data(spark, file_path):
+    """Load football event data from parquet file."""
+    return spark.read.parquet(file_path)
+
+def load_match_data(spark, file_path):
+    """Load football match data from parquet file."""
+    return spark.read.parquet(file_path) \
+                .where((f.col("status") == "Played") & (f.col("season") == "2017-2018")) \
+                .select("matchId", "homeTeamData", "awayTeamData") \
+                .cache()
+
+def process_match_goals(eventDF):
+    """Calculate goals for home and away teams."""
+    matchInfo = eventDF.select(["matchId", "competition", "season", "homeTeam", "awayTeam", "tags", "eventTeam", "event"])
+    
+    matchDF = matchInfo.where((f.col("event") == "Shot") | (f.col("event") == "Free Kick") | 
+                             (f.col("event") == "Others on the ball") | (f.col("event") == "Pass"))
+    
+    is_goal_and_accurate = (
+        f.array_contains(f.col("tags"), "Goal") &
+        f.array_contains(f.col("tags"), "Accurate")
+    )
+    is_own_goal = f.array_contains(f.col("tags"), "Own goal")
+    
+    matchDF = matchDF.groupBy("matchId").agg(
+        f.first("competition").alias("competition"),
+        f.first("season").alias("season"),
+        f.first("homeTeam").alias("homeTeam"),
+        f.first("awayTeam").alias("awayTeam"),
+        
+        # Count accurate goals for the home team and own goals triggered by the away team
+        f.sum(
+            f.when((is_goal_and_accurate & (f.col("eventTeam") == f.col("homeTeam"))) | 
+                  (is_own_goal & (f.col("eventTeam") == f.col("awayTeam"))), 1)
+            .otherwise(0)
+        ).alias("homeTeamGoals"),
+        f.sum(
+            f.when((is_goal_and_accurate & (f.col("eventTeam") == f.col("awayTeam"))) | 
+                  (is_own_goal & (f.col("eventTeam") == f.col("homeTeam"))), 1)
+            .otherwise(0)
+        ).alias("awayTeamGoals")
+    )
+    
+    return matchDF
+
+def calculate_team_stats(matchDF):
+    """Calculate stats for home and away teams."""
+    # Home team statistics
+    homeStatsDF = matchDF.select(
+        "competition",
+        "season",
+        f.col("homeTeam").alias("team"),
+        f.col("homeTeamGoals").alias("goalsScored"),
+        f.col("awayTeamGoals").alias("goalsConceded"),
+        
+        # Calculate wins, draws, losses in a single step
+        f.when(f.col("homeTeamGoals") > f.col("awayTeamGoals"), 1).otherwise(0).alias("wins"),
+        f.when(f.col("homeTeamGoals") == f.col("awayTeamGoals"), 1).otherwise(0).alias("draws"),
+        f.when(f.col("homeTeamGoals") < f.col("awayTeamGoals"), 1).otherwise(0).alias("losses"),
+        
+        # Calculate points
+        f.when(f.col("homeTeamGoals") > f.col("awayTeamGoals"), 3)
+         .when(f.col("homeTeamGoals") == f.col("awayTeamGoals"), 1)
+         .otherwise(0).alias("points"),
+        
+        # Constant 1 for games column
+        f.lit(1).alias("games")
+    )
+    
+    # Away team statistics
+    awayStatsDF = matchDF.select(
+        "competition",
+        "season",
+        f.col("awayTeam").alias("team"),
+        f.col("awayTeamGoals").alias("goalsScored"),
+        f.col("homeTeamGoals").alias("goalsConceded"),
+        
+        # Calculate wins, draws, losses in a single step
+        f.when(f.col("awayTeamGoals") > f.col("homeTeamGoals"), 1).otherwise(0).alias("wins"),
+        f.when(f.col("awayTeamGoals") == f.col("homeTeamGoals"), 1).otherwise(0).alias("draws"),
+        f.when(f.col("awayTeamGoals") < f.col("homeTeamGoals"), 1).otherwise(0).alias("losses"),
+        
+        # Calculate points
+        f.when(f.col("awayTeamGoals") > f.col("homeTeamGoals"), 3)
+         .when(f.col("awayTeamGoals") == f.col("homeTeamGoals"), 1)
+         .otherwise(0).alias("points"),
+        
+        # Constant 1 for games column
+        f.lit(1).alias("games")
+    )
+    
+    return homeStatsDF, awayStatsDF
+
+def create_season_table(homeStatsDF, awayStatsDF):
+    """Combine home and away stats to create a season table."""
+    # Aggregate statistics by competition, season, and team
+    seasonDF = homeStatsDF.union(awayStatsDF) \
+        .groupBy("competition", "season", "team") \
+        .agg(
+            f.sum("games").alias("games"),
+            f.sum("wins").alias("wins"),
+            f.sum("draws").alias("draws"),
+            f.sum("losses").alias("losses"),
+            f.sum("goalsScored").alias("goalsScored"),
+            f.sum("goalsConceded").alias("goalsConceded"),
+            f.sum("points").alias("points")
+        )
+    
+    return seasonDF
+
+def create_league_table(seasonDF, league, season):
+    """Create formatted league table for specific league and season."""
+    windowSpec = Window.orderBy(f.desc("points"), 
+                               f.desc(f.col("goalsScored") - f.col("goalsConceded")), 
+                               f.desc("goalsScored"))
+    
+    leagueDF = seasonDF \
+        .filter((f.col("competition") == league) & (f.col("season") == season)) \
+        .withColumn("GD_numeric", f.col("goalsScored") - f.col("goalsConceded")) \
+        .select(
+            f.row_number().over(windowSpec).alias("Pos"),
+            f.col("team").alias("Team"),
+            f.col("games").alias("Pld"),
+            f.col("wins").alias("W"),
+            f.col("draws").alias("D"),
+            f.col("losses").alias("L"),
+            f.col("goalsScored").alias("GF"),
+            f.col("goalsConceded").alias("GA"),
+            f.when(f.col("GD_numeric") >= 0, f.concat(f.lit("+"), f.col("GD_numeric")))
+              .otherwise(f.col("GD_numeric")).alias("GD"),
+            f.col("points").alias("Pts")
+        )
+    
+    return leagueDF
+
+def analyze_pass_success(eventDF, season):
+    """Analyze pass success rates for teams in the given season."""
+    # Filter pass events
+    passEventsDF = eventDF.filter(f.col("event") == "Pass").select(
+        "matchId", "competition", "season", "tags", "eventTeam"
+    )
+    
+    # Count total and successful passes for each team in each match
+    matchPassDF = passEventsDF \
+        .groupBy("matchId", "eventTeam", "competition", "season") \
+        .agg(
+            f.sum(f.when(f.array_contains(f.col("tags"), "Accurate"), 1).otherwise(0)).alias("successfulPasses"),
+            f.count("*").alias("totalPasses")
+        ) \
+        .withColumnRenamed("eventTeam", "team")
+    
+    # Calculate average pass success ratio per team per season
+    avgPassSuccessSeason = matchPassDF \
+        .where(f.col("season") == season) \
+        .withColumn("avgPassSuccess", (f.col("successfulPasses") / f.col("totalPasses")) * 100) \
+        .groupBy("competition", "team") \
+        .agg(f.round(f.avg("avgPassSuccess"), 2).alias("passSuccessRatio"))
+    
+    # Find teams with lowest pass success ratio in each competition
+    minPassSuccessRatioDF = avgPassSuccessSeason \
+        .groupBy("competition") \
+        .agg(f.min("passSuccessRatio").alias("minPassSuccessRatio"))
+    
+    lowestPassSuccessRatioDF = avgPassSuccessSeason.alias("Season") \
+        .join(
+            f.broadcast(minPassSuccessRatioDF).alias("min_ratio"), 
+            (f.col("Season.passSuccessRatio") == f.col("min_ratio.minPassSuccessRatio")) & 
+            (f.col("Season.competition") == f.col("min_ratio.competition")), 
+            "inner"
+        ) \
+        .select(
+            f.col("Season.competition"), 
+            f.col("Season.team"), 
+            f.col("Season.passSuccessRatio")
+        ) \
+        .orderBy(f.col("passSuccessRatio").asc())
+    
+    return lowestPassSuccessRatioDF, avgPassSuccessSeason
+
+def create_top_teams_table(seasonDF, avgPassSuccessSeason, season):
+    """Create table with top 2 teams from each league with their statistics."""
+    # Define window for ranking teams within each competition
+    windowSpec = Window.partitionBy("competition").orderBy(
+        f.desc("points"), 
+        f.desc(f.col("goalsScored") - f.col("goalsConceded")), 
+        f.desc("goalsScored")
+    )
+    
+    # Create league standings with position
+    leagueStandingsDF = seasonDF \
+        .filter(f.col("season") == season) \
+        .withColumn("GD_numeric", f.col("goalsScored") - f.col("goalsConceded")) \
+        .select(
+            f.row_number().over(windowSpec).alias("Pos"),
+            "competition", 
+            f.col("team").alias("Team"),
+            f.col("games").alias("Pld"),
+            f.col("wins").alias("W"),
+            f.col("draws").alias("D"),
+            f.col("losses").alias("L"),
+            f.col("goalsScored").alias("GF"),
+            f.col("goalsConceded").alias("GA"),
+            f.when(f.col("GD_numeric") >= 0, f.concat(f.lit("+"), f.col("GD_numeric")))
+              .otherwise(f.col("GD_numeric")).alias("GD"),
+            f.col("points").alias("Pts"), 
+            f.round(f.col("points") / f.col("games"), 2).alias("Avg")
+        ) \
+        .where((f.col("Pos") == 1) | (f.col("Pos") == 2))
+    
+    # Join with pass success data
+    bestDF = f.broadcast(leagueStandingsDF).alias("standDF") \
+        .join(avgPassSuccessSeason, ["Team"], "left") \
+        .select(
+            "Team", 
+            f.col("standDF.competition"), 
+            "Pos", 
+            "Pld", 
+            "W", 
+            "D", 
+            "L", 
+            "GF", 
+            "GA", 
+            "GD", 
+            "Pts", 
+            "Avg", 
+            f.col("passSuccessRatio").alias("PassRatio")  
+        ) \
+        .orderBy(f.col("Avg").desc())
+    
+    return bestDF
+
+def run_match_analysis(spark, events_path, season="2017-2018"):
+    """Run complete match analysis pipeline."""
+    eventDF = load_event_data(spark, events_path)
+    
+    # Process match goals
+    matchDF = process_match_goals(eventDF)
+    
+    # Calculate team statistics
+    homeStatsDF, awayStatsDF = calculate_team_stats(matchDF)
+    
+    # Create season table
+    seasonDF = create_season_table(homeStatsDF, awayStatsDF)
+    
+    # Create league table for EPL
+    englandDF = create_league_table(seasonDF, "English Premier League", season)
+    print(f"English Premier League table for season {season}")
+    englandDF.show(20, False)
+    
+    # Analyze pass success
+    lowestPassRatioDF, passSuccessDF = analyze_pass_success(eventDF, season)
+    print(f"The teams with the lowest ratios for successful passes for each league in season {season}:")
+    lowestPassRatioDF.show(5, False)
+    
+    # Create top teams table
+    topTeamsDF = create_top_teams_table(seasonDF, passSuccessDF, season)
+    print(f"The top 2 teams for each league in season {season}")
+    topTeamsDF.show(10, False)
+    
+    return {
+        "match_data": matchDF,
+        "season_data": seasonDF, 
+        "england_table": englandDF,
+        "lowest_pass_ratio": lowestPassRatioDF,
+        "top_teams": topTeamsDF
+    }
+
+if __name__ == "__main__":
+    from pyspark.sql import SparkSession
+    
+    # Initialize Spark session
+    spark = SparkSession.builder \
+        .appName("Football Match Analysis") \
+        .getOrCreate()
+    
+    # Set file path
+    events_path = "abfss://shared@tunics320f2024gen2.dfs.core.windows.net/assignment/football/events.parquet"
+    
+    # Run analysis
+    run_match_analysis(spark, events_path)
+    
+    # Stop Spark session
+    spark.stop()
