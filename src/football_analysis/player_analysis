@@ -1,0 +1,225 @@
+"""
+Football Player Analysis Module
+
+This module analyzes football player data, calculating playing time,
+plus-minus statistics, and identifying top players.
+"""
+
+from pyspark.sql import functions as f
+from pyspark.sql import DataFrame
+from pyspark.sql.types import IntegerType
+
+def load_player_data(spark, file_path):
+    """Load player data from parquet file."""
+    return spark.read.parquet(file_path).select(
+        "playerId", 
+        f.concat_ws(" ", "firstName", "lastName").alias("player"),
+        "birthArea", 
+        "role"
+    )
+
+def calculate_match_duration(eventDF):
+    """Calculate match duration from event data."""
+    EventH2 = eventDF \
+        .where(f.col("eventPeriod") == "2H") \
+        .select(["matchId", "eventTime"])
+    
+    TimeMatchDF = EventH2 \
+        .withColumn("matchLength", f.ceil(f.col("eventTime") / 60) + 45) \
+        .groupBy("matchId") \
+        .agg(f.max(f.col("matchLength")).alias("matchLength"))
+    
+    return TimeMatchDF
+
+def extract_substitution_data(matchDF):
+    """Extract substitution data from match data."""
+    # Extract home team substitutions
+    substitutions_home = (
+        matchDF
+            .select(
+                "matchId", 
+                f.col("homeTeamData.team").alias("team"), 
+                f.explode(f.array(
+                    "homeTeamData.substitution1", 
+                    "homeTeamData.substitution2", 
+                    "homeTeamData.substitution3"
+                )).alias("substitution")
+            )
+            .select(
+                "matchId", 
+                "team", 
+                f.col("substitution.playerIn").alias("playerInId"),
+                f.col("substitution.playerOut").alias("playerOutId"),
+                f.col("substitution.minute").alias("startMinute")
+            )
+            .filter(f.col("substitution.playerIn").isNotNull())
+    )
+    
+    # Extract away team substitutions
+    substitutions_away = (
+        matchDF
+            .select(
+                "matchId", 
+                f.col("awayTeamData.team").alias("team"), 
+                f.explode(f.array(
+                    "awayTeamData.substitution1", 
+                    "awayTeamData.substitution2", 
+                    "awayTeamData.substitution3"
+                )).alias("substitution")
+            )
+            .select(
+                "matchId", 
+                "team", 
+                f.col("substitution.playerIn").alias("playerInId"),
+                f.col("substitution.playerOut").alias("playerOutId"),
+                f.col("substitution.minute").alias("startMinute")
+            )
+            .filter(f.col("substitution.playerIn").isNotNull())
+    )
+    
+    # Combine substitutions
+    substitutions = substitutions_home.union(substitutions_away)
+    
+    return substitutions
+
+def extract_bench_players(matchDF, substitutions):
+    """Extract bench players who weren't substituted in."""
+    # Extract bench players 
+    bench_players = (
+        matchDF.select(
+            f.col("matchId"),
+            f.col("homeTeamData.team").alias("team"),
+            f.explode(f.col("homeTeamData.bench")).alias("playerId")
+        )
+        .union(
+            matchDF.select(
+                f.col("matchId"),
+                f.col("awayTeamData.team").alias("team"),
+                f.explode(f.col("awayTeamData.bench")).alias("playerId")
+            )
+        )
+    )
+    
+    # Exclude bench players who were substituted in
+    bench_players = bench_players \
+        .join(
+            substitutions.select("matchId", f.col("playerInId").alias("playerId")),
+            on=["matchId", "playerId"],
+            how="leftanti"  # Exclude players who appear in substitutions as playerInId
+        ) \
+        .select(
+            "matchId", 
+            "team",
+            f.col("playerId"),
+            f.lit(None).cast(IntegerType()).alias("startMinute"),
+            f.lit(None).cast(IntegerType()).alias("endMinute"),
+            f.lit(0).alias("minutes")
+        )
+    
+    return bench_players
+
+def extract_lineup_players(matchDF):
+    """Extract starting lineup players."""
+    lineup_players = (
+        matchDF.select(
+            f.col("matchId"),
+            f.explode(f.col("homeTeamData.lineup")).alias("playerId"),
+            f.col("homeTeamData.team").alias("team")
+        )
+        .union(
+            matchDF.select(
+                f.col("matchId"),
+                f.explode(f.col("awayTeamData.lineup")).alias("playerId"),
+                f.col("awayTeamData.team").alias("team")
+            )
+        )
+        .withColumn("startMinute", f.lit(0))
+    )
+    
+    return lineup_players
+
+def calculate_playing_time(lineup_players, substitutions, match_durations, bench_players):
+    """Calculate playing time for each player in each match."""
+    # Combine lineups with substitutions and match length
+    combined_players = (
+        lineup_players
+        .union(substitutions.select("matchId", f.col("playerInId").alias("playerId"), "team", "startMinute"))
+        .join(match_durations, "matchId", "left")
+        .withColumnRenamed("matchLength", "endMinute")
+    )
+    
+    # Update end time for substituted-out players
+    combined_players = (combined_players.alias("all") 
+        .join(
+            substitutions.alias("sub"),
+            (f.col("all.matchId") == f.col("sub.matchId")) & 
+            (f.col("all.playerId") == f.col("sub.playerOutId")),
+            "left"
+        )
+        .select(
+            "all.matchId",
+            "all.team", 
+            "all.playerId", 
+            "all.startMinute", 
+            (f.coalesce(f.col("sub.startMinute"), f.col("all.endMinute")).alias("endMinute"))
+        )
+    )
+    
+    # Calculate minutes per match per player and combine with bench players
+    time_played_df = (
+        combined_players
+        .select("*", (f.col("endMinute") - f.col("startMinute")).alias("minutes"))
+        .union(bench_players)
+    )
+    
+    # Calculate total minutes played across all matches
+    total_time_df = (
+        time_played_df
+        .groupBy("playerId")
+        .agg(f.sum("minutes").alias("minutes"))
+    )
+    
+    return time_played_df, total_time_df
+
+def find_players_with_most_minutes_by_role(total_time_df, player_df):
+    """Find players with most playing time by role."""
+    # Join minutes with player information
+    most_minutes_df = (
+        total_time_df.join(player_df, "playerId", "inner")
+        .select("role", "player", "birthArea", "minutes")
+    )
+    
+    # Find maximum minutes by role
+    from pyspark.sql import Window
+    window_spec = Window.partitionBy("role")
+    most_minutes_df = most_minutes_df.withColumn(
+        "max_minutes", 
+        f.max("minutes").over(window_spec)
+    )
+    most_minutes_df = most_minutes_df.filter(
+        f.col("minutes") == f.col("max_minutes")
+    ).drop("max_minutes")
+    
+    return most_minutes_df
+
+def calculate_plus_minus_statistics(time_played_df, eventDF):
+    """Calculate plus-minus statistics for players."""
+    # Extract goal events
+    is_goal_and_accurate = (
+        f.array_contains(f.col("tags"), "Goal") &
+        f.array_contains(f.col("tags"), "Accurate")
+    )
+    is_own_goal = f.array_contains(f.col("tags"), "Own goal")
+    
+    goal_df = eventDF \
+        .where(
+            (f.col("event").isin("Shot", "Free Kick", "Others on the ball", "Pass")) &
+            ((is_goal_and_accurate) | (is_own_goal))
+        ) \
+        .select(
+            "matchId",
+            "eventPeriod",
+            # Calculate normal time based on event time and period
+            f.when(f.col("eventPeriod") == "1H", f.ceil(f.col("eventTime") / 60))
+             .otherwise(f.ceil(f.col("eventTime") / 60) + 45).alias("normalTime"),
+            # Calculate extra time for events beyond 45
